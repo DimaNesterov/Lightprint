@@ -1,0 +1,43 @@
+# XcodeGen spec. Generate the Xcode project with:  xcodegen generate
+name: Lumen
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+packages:
+  LumenCore:
+    path: LumenCore
+
+targets:
+  Lumen:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: LumenCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dima.lumen
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""          # set your team here or in Xcode → Signing & Capabilities
+        ENABLE_PREVIEWS: NO
+        MTL_ENABLE_DEBUG_INFO: INCLUDE_SOURCE
+
+schemes:
+  Lumen:
+    build:
+      targets:
+        Lumen: all
+    run:
+      config: Release                 # building the light field needs optimised code
+    test:
+      config: Debug

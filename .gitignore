@@ -1,0 +1,12 @@
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+build/
+.build/
+.swiftpm/
+Package.resolved
+__pycache__/
+*.pyc
+prototype/*.png
+.DS_Store
