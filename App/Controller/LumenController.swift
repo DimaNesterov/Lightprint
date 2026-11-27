@@ -8,6 +8,12 @@ enum Mode: Equatable {
     case align    // re-mark two reference points after relocalisation failed
 }
 
+enum InterfaceStage: Equatable {
+    case visible     // everything
+    case playOnly    // only the button that draws the light in
+    case hidden      // nothing: a tap anywhere brings the interface back
+}
+
 enum MarkTool: String, CaseIterable, Identifiable {
     case lamp, window
     var id: String { rawValue }
@@ -44,7 +50,18 @@ final class LumenController: NSObject, ObservableObject {
     @Published private(set) var alignTaps: [Vec3] = []
     @Published private(set) var trackingText = ""
     @Published private(set) var trackingNormal = false
+    /// Finding a room scanned before (from LiDAR geometry) in the current AR session.
     @Published private(set) var relocalizing = false
+    /// How much of the room has been looked at while finding it, 0…1.
+    @Published private(set) var findingProgress: Double = 0
+    @Published private(set) var findingHint = ""
+    private var probe: GeometryProbe?
+    private var roomReference: RoomReference?
+    private var referenceTask: Task<RoomReference?, Never>?
+    private var headingBins = Set<Int>()
+    private var registrationRunning = false
+    private var lastAttempt = Date.distantPast
+    private var lastConfident: RegistrationResult?
     @Published private(set) var needsAlignment = false
     @Published private(set) var message: String?
     @Published private(set) var lidarAvailable = true
@@ -68,8 +85,10 @@ final class LumenController: NSObject, ObservableObject {
     @Published private(set) var isBuilding = false
     @Published private(set) var splatCount = 0
     @Published var showLight = true { didSet { pushRenderState() } }
-    /// Clean view for watching and filming: every control and marker is hidden.
-    @Published var interfaceHidden = false { didSet { pushRenderState() } }
+    /// Clean view for watching and filming, in two steps: first only the button that draws the light in stays,
+    /// then nothing at all.
+    @Published var interface: InterfaceStage = .visible { didSet { pushRenderState() } }
+    var interfaceHidden: Bool { interface != .visible }
     @Published var timelinePosition: Double = 1 { didSet { updateWeights() } }
     @Published var timelineMode: Timeline.Mode = .accumulate { didSet { updateWeights() } }
     @Published private(set) var isPlaying = false
@@ -77,6 +96,8 @@ final class LumenController: NSObject, ObservableObject {
     /// Time of day of each layer (sorted), as dates on 1 Jan 2001 UTC.
     private(set) var layerDates: [Date] = []
     private var lastSplats: [Splat] = []
+    /// The next light that arrives is drawn in from its sources (after a new moment is saved).
+    private var revealOnNextApply = false
     private var buildTask: Task<BuildResult, Never>?
     /// Which marked sources shine in the most recent moment (shown on the markers).
     @Published private(set) var sourceShining: [UUID: Bool] = [:]
@@ -115,6 +136,7 @@ final class LumenController: NSObject, ObservableObject {
             return
         }
         session.delegate = self
+        migrateRoomNames()
         rooms = RoomStore.listRooms()
         if let s = UserDefaults.standard.string(forKey: Self.lastRoomKey), let id = UUID(uuidString: s),
            let m = RoomStore.loadManifest(id) {
@@ -129,24 +151,22 @@ final class LumenController: NSObject, ObservableObject {
     func appWillResignActive() {
         if isCapturing { cancelCapture(reason: "Scan interrupted") }
         stopPlaying()
-        saveWorldMap()
     }
 
-    private func configuration(worldMap: ARWorldMap?) -> ARWorldTrackingConfiguration {
+    private func configuration() -> ARWorldTrackingConfiguration {
         let c = ARWorldTrackingConfiguration()
         c.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
         c.planeDetection = []
         c.environmentTexturing = .none
         c.isLightEstimationEnabled = false
         c.videoHDRAllowed = false          // HDR video would break the camera as a light meter
-        c.initialWorldMap = worldMap
         return c
     }
 
-    private func runSession(worldMap: ARWorldMap?) {
-        session.run(configuration(worldMap: worldMap), options: [.resetTracking, .removeExistingAnchors])
+    /// Always a fresh session: rooms are found from their geometry, not from ARKit's map (see `startFinding`).
+    private func runSession() {
+        session.run(configuration(), options: [.resetTracking, .removeExistingAnchors])
         whiteBalancePending = true
-        relocalizing = worldMap != nil
         trackingNormal = false
     }
 
@@ -161,13 +181,14 @@ final class LumenController: NSObject, ObservableObject {
         for c in m.captures {
             if let v = RoomStore.loadVoxels(room: m.id, capture: c.id) { voxels[c.id] = v }
         }
-        let map = RoomStore.loadWorldMap(room: m.id)
-        let hasData = !m.sources.isEmpty || !m.captures.isEmpty
-        needsAlignment = hasData && map == nil
         mode = .main
         pendingCorner = nil
         alignTaps = []
-        runSession(worldMap: hasData ? map : nil)
+        stopFinding()
+        runSession()
+        // A room with earlier scans is found from its geometry; one with only marked sources needs manual alignment.
+        needsAlignment = m.captures.isEmpty && !m.sources.isEmpty
+        if !m.captures.isEmpty { startFinding() }
         timelinePosition = 1
         rebuild()
         pushRenderState()
@@ -220,14 +241,126 @@ final class LumenController: NSObject, ObservableObject {
         }
     }
 
-    /// Saves ARKit's map of the room so a later session can relocalise into the same coordinates.
-    private func saveWorldMap() {
-        guard isAligned, mode != .align else { return }
-        let roomID = manifest.id
-        session.getCurrentWorldMap { map, _ in
-            guard let map else { return }
-            try? RoomStore.saveWorldMap(map, room: roomID)
+    /// Rooms created before the interface was in English keep their old names; give them English ones.
+    private func migrateRoomNames() {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "MMM d, HH:mm"
+        for var room in RoomStore.listRooms() where room.name.hasPrefix("Комната") {
+            room.name = "Room · \(f.string(from: room.created))"
+            try? RoomStore.save(room)
         }
+    }
+
+    // MARK: Finding the room
+
+    /// Starts finding the room in the current session: the user looks around, LiDAR sees walls and furniture,
+    /// and they are matched against the geometry of the earlier scans. Light does not matter.
+    private func startFinding() {
+        relocalizing = true
+        findingProgress = 0
+        findingHint = ""
+        probe = GeometryProbe()
+        headingBins = []
+        registrationRunning = false
+        lastAttempt = .distantPast
+        lastConfident = nil
+        roomReference = nil
+        let positions = manifest.captures.flatMap { voxels[$0.id]?.map(\.position) ?? [] }
+        referenceTask?.cancel()
+        let task = Task.detached(priority: .userInitiated) { RoomReference(positions: positions) }
+        referenceTask = task
+        Task { [weak self] in
+            let reference = await task.value
+            guard let self, self.relocalizing, self.referenceTask == task else { return }
+            if let reference {
+                self.roomReference = reference
+            } else {
+                self.stopFinding()
+                self.needsAlignment = true
+                self.pushRenderState()
+                self.flash("Not enough geometry in the earlier scans: tap Align")
+            }
+        }
+    }
+
+    private func stopFinding() {
+        relocalizing = false
+        probe = nil
+        roomReference = nil
+        referenceTask?.cancel()
+        referenceTask = nil
+        lastConfident = nil
+        registrationRunning = false
+    }
+
+    private func feedFinding(_ frame: ARFrame) {
+        guard let probe, case .normal = frame.camera.trackingState else { return }
+        // Which directions have been looked at (10° bins of heading).
+        let f = frame.camera.transform.columns.2
+        let heading = atan2(-f.x, -f.z) * 180 / .pi
+        headingBins.insert(Int(((heading + 360).truncatingRemainder(dividingBy: 360)) / 10))
+        if frameCounter % 3 == 0, probe.canAccept { probe.add(frame) }
+        let progress = min(Double(headingBins.count) / 15, Double(probe.cellCount) / 3000, 1)
+        if (progress * 100).rounded() != (findingProgress * 100).rounded() { findingProgress = progress }
+
+        guard !registrationRunning, Date().timeIntervalSince(lastAttempt) > 1.5, headingBins.count >= 15,
+              probe.cellCount >= 3000, let reference = roomReference else { return }
+        registrationRunning = true
+        lastAttempt = Date()
+        probe.snapshot { [weak self] points, eyes in
+            let task = Task.detached(priority: .userInitiated) {
+                RoomRegistration.register(reference: reference, probe: points, eyes: eyes)
+            }
+            Task { [weak self] in
+                let result = await task.value
+                guard let self else { return }
+                self.registrationRunning = false
+                self.handleRegistration(result)
+            }
+        }
+    }
+
+    /// A pose is accepted only when it is clearly better than any other and two attempts in a row agree.
+    private func handleRegistration(_ result: RegistrationResult?) {
+        guard relocalizing else { return }
+        guard let result, result.isConfident else {
+            findingHint = "Keep looking around: walls, corners and furniture"
+            return
+        }
+        if let last = lastConfident, result.agrees(with: last) {
+            finishFinding(result)
+        } else {
+            lastConfident = result
+        }
+    }
+
+    private func finishFinding(_ result: RegistrationResult) {
+        // The pose maps this session into the room; the room's data moves into this session.
+        let toSession = result.pose.transform.inverse
+        stopFinding()
+        applyRoomTransform(toSession)
+        applySplats(lastSplats.map { splat in
+            var moved = splat
+            moved.position = toSession.apply(splat.position)
+            return moved
+        })
+        flash("Room found")
+        pushRenderState()
+        pushMarkers()
+        rebuild()      // a build still running in the old coordinates is discarded
+    }
+
+    /// Moves every source and every moment of the room by `t` and saves them.
+    private func applyRoomTransform(_ t: RigidTransform) {
+        manifest.sources = manifest.sources.map { $0.transformed(by: t) }
+        for info in manifest.captures {
+            guard let v = voxels[info.id] else { continue }
+            let moved = v.map { SurfaceVoxel(position: t.apply($0.position), radiance: $0.radiance, samples: $0.samples) }
+            voxels[info.id] = moved
+            try? RoomStore.saveVoxels(moved, room: manifest.id, capture: info.id)
+        }
+        saveManifest()
     }
 
     // MARK: Frames
@@ -244,6 +377,7 @@ final class LumenController: NSObject, ObservableObject {
             if !locked { whiteBalancePending = true }
         }
         if isCapturing { captureFrame(frame) }
+        if relocalizing { feedFinding(frame) }
     }
 
     private func updateTracking(_ state: ARCamera.TrackingState) {
@@ -259,20 +393,9 @@ final class LumenController: NSObject, ObservableObject {
             case .initializing: text = "Starting up: move the phone slowly"
             case .excessiveMotion: text = "Too fast, slow down"
             case .insufficientFeatures: text = "Not enough detail, or too dark"
-            case .relocalizing: text = "Looking for the room: point the camera where you scanned before"
+            case .relocalizing: text = "Recovering tracking: point the camera where it was"
             @unknown default: text = "Tracking limited"
             }
-        }
-        if case .limited(.relocalizing) = state, !relocalizing {
-            relocalizing = true
-            pushRenderState()
-            pushMarkers()
-        }
-        if normal, relocalizing {
-            relocalizing = false
-            if !needsAlignment { flash("Room found") }
-            pushRenderState()
-            pushMarkers()
         }
         if trackingNormal != normal { trackingNormal = normal }
         if trackingText != text { trackingText = text }
@@ -442,7 +565,6 @@ final class LumenController: NSObject, ObservableObject {
         pendingCorner = nil
         pushRenderState()
         pushMarkers()
-        saveWorldMap()
         rebuild()
     }
 
@@ -506,10 +628,10 @@ final class LumenController: NSObject, ObservableObject {
         }
         cancelCapture(reason: nil)
         stopPlaying()
+        stopFinding()
         alignTaps = []
         mode = .align
-        runSession(worldMap: nil)
-        relocalizing = false
+        runSession()
         needsAlignment = true
         pushRenderState()
         pushMarkers()
@@ -518,9 +640,9 @@ final class LumenController: NSObject, ObservableObject {
     func cancelAlignment() {
         mode = .main
         alignTaps = []
-        let map = RoomStore.loadWorldMap(room: manifest.id)
-        runSession(worldMap: map)
-        needsAlignment = map == nil && (!manifest.sources.isEmpty || !manifest.captures.isEmpty)
+        runSession()
+        needsAlignment = manifest.captures.isEmpty && !manifest.sources.isEmpty
+        if !manifest.captures.isEmpty { startFinding() }
         pushRenderState()
         pushMarkers()
     }
@@ -541,19 +663,10 @@ final class LumenController: NSObject, ObservableObject {
             return
         }
         let t = Alignment.yawTranslation(old: ref[0], ref[1], new: new[0], new[1])
-        manifest.sources = manifest.sources.map { $0.transformed(by: t) }
-        for info in manifest.captures {
-            guard let v = voxels[info.id] else { continue }
-            let moved = v.map { SurfaceVoxel(position: t.apply($0.position), radiance: $0.radiance, samples: $0.samples) }
-            voxels[info.id] = moved
-            try? RoomStore.saveVoxels(moved, room: manifest.id, capture: info.id)
-        }
-        saveManifest()
+        applyRoomTransform(t)
         needsAlignment = false
         alignTaps = []
         mode = .main
-        RoomStore.deleteWorldMap(room: manifest.id)
-        saveWorldMap()
         rebuild()
         pushRenderState()
         pushMarkers()
@@ -676,8 +789,8 @@ final class LumenController: NSObject, ObservableObject {
         manifest.captures.append(CaptureInfo(id: id, date: date, whiteBalanceKelvin: Self.whiteBalanceKelvin,
                                              voxelCount: result.voxels.count, sourceLuminance: measured))
         saveManifest()
-        saveWorldMap()
         timelinePosition = 1
+        revealOnNextApply = true
         let area = Float(result.voxels.count) * manifest.law.cellSize * manifest.law.cellSize
         flash("Moment saved: \(Int(area.rounded())) m² of surfaces, \(result.frames) frames")
         rebuild()
@@ -693,12 +806,19 @@ final class LumenController: NSObject, ObservableObject {
         manifest.captures = []
         voxels = [:]
         saveManifest()
+        if relocalizing {
+            // Nothing left to find the room by: the marked sources have to be aligned by hand.
+            stopFinding()
+            needsAlignment = !manifest.sources.isEmpty
+            pushRenderState()
+            pushMarkers()
+        }
         timelinePosition = 1
         rebuild()
         flash("Moments deleted: ready for a new scan")
     }
 
-    /// Deletes moments, windows, lamps and the room map: the room starts from scratch.
+    /// Deletes moments, windows and lamps: the room starts from scratch.
     func resetRoom() {
         cancelCapture(reason: nil)
         stopPlaying()
@@ -714,7 +834,8 @@ final class LumenController: NSObject, ObservableObject {
         pendingCorner = nil
         alignTaps = []
         needsAlignment = false
-        runSession(worldMap: nil)
+        stopFinding()
+        runSession()
         timelinePosition = 1
         rebuild()
         pushRenderState()
@@ -782,6 +903,10 @@ final class LumenController: NSObject, ObservableObject {
         lastSplats = splats
         splatCount = splats.count
         renderer?.setSplats(splats)
+        if revealOnNextApply, !splats.isEmpty {
+            revealOnNextApply = false
+            renderer?.startReveal()
+        }
         updateWeights()
     }
 
@@ -836,6 +961,14 @@ final class LumenController: NSObject, ObservableObject {
         }
     }
 
+    /// From the play-only stage: the last button fades out together with the light, and the light starts to be
+    /// drawn in once the button is gone, so a screen recording shows only the camera and the light.
+    func playRevealHidden() {
+        interface = .hidden
+        if !showLight { showLight = true }
+        renderer?.startReveal(force: true, delay: 0.35)
+    }
+
     func stopPlaying() {
         playTimer?.invalidate()
         playTimer = nil
@@ -848,7 +981,10 @@ final class LumenController: NSObject, ObservableObject {
         guard let renderer else { return }
         renderer.settings = render
         renderer.cameraDim = render.cameraDim
-        renderer.showLight = showLight && isAligned && mode == .main && !isCapturing && !isSaving
+        // Every time the light comes into view (switched on, room found, scan or marking finished), draw it in.
+        let show = showLight && isAligned && mode == .main && !isCapturing && !isSaving
+        if show && !renderer.showLight { renderer.startReveal() }
+        renderer.showLight = show
         renderer.showScan = isCapturing || isSaving
         renderer.showMarkers = !interfaceHidden
             && (mode == .align || (isAligned && (mode == .mark || render.showMarkers)))
@@ -922,7 +1058,11 @@ final class LumenController: NSObject, ObservableObject {
             return alignTaps.isEmpty ? "Alignment: tap the first marked lamp" : "Now the second lamp"
         case .main:
             if !trackingText.isEmpty { return trackingText }
-            if needsAlignment { return "No room map: tap Align" }
+            if relocalizing {
+                if !findingHint.isEmpty, findingProgress >= 1 { return findingHint }
+                return "Finding the room: look around slowly, walls and furniture (\(Int((findingProgress * 100).rounded()))%)"
+            }
+            if needsAlignment { return "Tap Align and mark the same window corners or lamps" }
             if isCapturing { return "Scan the whole room: walls, floor, ceiling, corners. Stop when everything is covered" }
             if isSaving { return "Saving the moment…" }
             if manifest.sources.isEmpty { return "Mark the windows and lamps" }

@@ -35,6 +35,8 @@ struct SettingsView: View {
                     }
                     Toggle("Hide light behind objects (LiDAR)", isOn: $controller.render.occlusion)
                     Toggle("Show windows and lamps", isOn: $controller.render.showMarkers)
+                    Toggle("Draw the light in", isOn: $controller.render.animateReveal)
+                    Toggle("Particles move aside", isOn: $controller.render.pushParticles)
                 } header: {
                     Text("Look")
                 } footer: {

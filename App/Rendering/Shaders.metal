@@ -59,6 +59,11 @@ struct SplatUniforms {
     float nearEnd;              // …and fade in up to this distance
     float occlusion;            // 1 = hide splats behind real surfaces (LiDAR), 0 = off
     uint layerCount;
+    float4 cameraPush;          // camera position, w = push strength 0…1 (how fast the phone moves)
+    float revealTime;           // seconds since the light started to be drawn in; huge = fully drawn
+    float revealSpeed;          // metres per second of the drawing front along the rays
+    float pushRadius;           // metres around the phone
+    float pushAmount;           // largest displacement, metres
 };
 
 struct SplatOut {
@@ -82,7 +87,30 @@ vertex SplatOut splatVertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     float w = layer < u.layerCount ? layerWeights[layer] : 0.0;
     if (w < 0.002) { return o; }
 
-    float4 world = float4(s.positionLayer.xyz, 1);
+    // Splats near a moving phone move slightly aside (straight away from it), and drift back when it stops.
+    float3 position = s.positionLayer.xyz;
+    if (u.cameraPush.w > 0.001) {
+        float3 away = position - u.cameraPush.xyz;
+        float d = length(away);
+        if (d < u.pushRadius && d > 1e-4) {
+            position += away / d * (u.pushAmount * u.cameraPush.w * (1.0 - d / u.pushRadius));
+        }
+    }
+
+    // Drawing the light in: a front runs out of every source along its rays; ambient light follows.
+    float reveal = 1.0;
+    if (u.revealTime < 1e5) {
+        float key = s.color.w;
+        if (key >= 0.0) {
+            reveal = saturate((u.revealTime * u.revealSpeed - key) / 0.25);
+        } else {
+            float start = 0.6 + (-key) * 2.4;
+            reveal = saturate((u.revealTime - start) / 0.4);
+        }
+    }
+    if (reveal < 0.002) { return o; }
+
+    float4 world = float4(position, 1);
     float z = -(u.view * world).z;
     if (z < u.nearStart) { return o; }
     float fade = saturate((z - u.nearStart) / max(u.nearEnd - u.nearStart, 1e-3));
@@ -104,7 +132,7 @@ vertex SplatOut splatVertex(uint vid [[vertex_id]], uint iid [[instance_id]],
             }
         }
     }
-    float weight = u.opacity * w * fade * visibility;
+    float weight = u.opacity * w * fade * visibility * reveal;
     if (weight < 1e-4) { return o; }
 
     float radius = max(u.focalPixels * u.sigma / z, u.minPixels);

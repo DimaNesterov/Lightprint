@@ -1,114 +1,175 @@
 # Lightprint
 
-An AR app for iPhone and iPad with LiDAR. Over a day you capture short "moments" of the light in a room.
-Lightprint turns them into a light figure anchored in the room. The figure is built only from identical
-Gaussian splats.
+An AR experiment for iPhone and iPad with LiDAR. You scan a room several times over a day, and Lightprint
+draws its light as a figure in the air. Rays come from the windows and lamps, ambient light fills the room,
+warm light shows as amber and cold light as blue, and the figure is dense where the light is strong.
 
-> In the code the project still uses its working title, Lumen: the `Lumen` app target and the `LumenCore`
-> package.
+Built with ARKit, LiDAR and Metal. The phone's camera works as a light meter. The whole figure is made of
+one element, identical Gaussian splats: one splat is one quantum of light. Intensity is density, colour is
+the measured colour temperature, and nothing else changes from splat to splat.
 
-## The visual law
+## Background
 
-- **One splat is one quantum of light.** Every splat has the same size, shape and opacity. Only the colour
-  differs.
-- **Colour is the measured colour temperature** on a fixed scale: amber (warm), neutral, ice blue (cold).
-- **Intensity is density.** Where there is more light, splats stand closer together, down to one per 4 cm
-  cell. Ambient light becomes a sparse lattice.
-- **Direct light is rays** from marked windows and lamps to the surfaces they light.
-  - Lit surfaces in the same direction from a source share one ray: 6° bins for lamps, 12 cm steps across a
-    window.
-  - Only the first surface along a ray is lit. What lies behind it is in shadow.
-- **Rays widen like the light they carry.** A ray is as wide as the patch it leaves at the source and the
-  patch it lights. Every slice carries the same energy.
-  - Lamp rays spread out and dissolve, with density falling as 1/r².
-  - Sunlight through a window stays a parallel shaft.
-  - Rays are drawn narrower than their full bundle (`rayWidth`, 0.3 by default), so the direction stays
-    readable.
-- **A source casts rays only while it shines.** In each moment a window or lamp counts as a light source only
-  if it is itself at least 4× brighter than the room's median surface. A dark window at night, or a dim
-  screen marked as a lamp, casts nothing. Lit surfaces that no shining source explains get no rays.
-- **One quantum for the whole day.** A sunny noon is denser than an overcast morning.
+Light in a room is invisible until it lands on something. Architectural daylight studies simulate light and
+paint the result onto surfaces as false-colour maps. Lightprint measures it instead. The phone records how
+bright every surface is, and what colour its light has, at a given moment. The app then reconstructs where
+that light came from and draws its path through the room.
 
-## How the light is measured
+The figure follows a fixed set of rules rather than visual effects. There are no extra shapes, clouds or
+glows, only splats placed according to the measurements. The visual language stays the same from a sunny
+noon to a lamp at night, so moments can be compared directly.
 
-- **White balance** is locked at 5000 K for the whole session. A pixel's colour then reflects the light's
-  colour, not the camera's adjustment.
-- **One moment is one scan of the whole room.** It runs until you stop it, at most 5 minutes.
-  - Exposure stays automatic, biased by −1 EV to keep highlights.
-  - Every frame is divided by its own exposure time × ISO, taken from EXIF. This keeps frames and moments
-    comparable.
-- **Surface cells.** Every high-confidence LiDAR pixel (128 × 96 per frame) becomes a world point with the
-  camera's colour, averaged into 4 cm cells.
-  - A saturated pixel only counts as a lower bound ("at least this bright").
-- **Source brightness** is measured from camera pixels during the scan: inside the window's rectangle (sky,
-  blinds, street) and around the lamp's marked point. Pixels with something in front of the source are
-  skipped.
-- **Window glass.** LiDAR sees through it, so points behind a window's wall (the street) are dropped.
-- **Moments from different days** are combined by time of day.
+## How it works
 
-## Build
+### Capturing a moment
 
-Requirements: Xcode 16, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and an iPhone or iPad with LiDAR
-running iOS 18.
+1. **Mark the sources.** A lamp takes one tap on its shade or bulb, a window two taps on opposite corners.
+   You can drag a window's corners afterwards; they slide within the window's plane.
+2. **Scan the room.** One moment is one sweep over the whole room, for as long as it takes (up to 5
+   minutes).
+   - White balance is locked at 5000 K for the whole session, so a pixel's colour is the colour of the light.
+   - Exposure stays automatic with a −1 EV bias. Every frame is normalised by its own exposure:
+     `radiance = linear RGB / (exposure time × ISO)`.
+3. **Surfaces.** Every high-confidence LiDAR pixel (128 × 96 per frame) becomes a world point carrying its
+   camera colour. The points are averaged into 4 cm cells.
+   - A clipped pixel only counts as a lower bound.
+   - LiDAR sees through glass, so points behind a window's wall are dropped.
+4. **Sources.** During the scan the app also reads the camera pixels inside each window's rectangle and
+   around each lamp, skipping pixels where something stands in front. This tells a bright sky from closed
+   blinds.
+
+### The light law
+
+For every moment:
+
+1. **Colour.** Each cell's correlated colour temperature (McCamy) is placed on a fixed palette in mired
+   space. 5000 K is neutral and ±90 mired reach the ends: amber at about 3450 K, ice blue at about 9100 K.
+2. **Which sources shine.** A window or lamp casts rays only if it is itself at least 4× brighter than the
+   room's median surface in that moment. A dark window at night, or a dim screen marked as a lamp, casts
+   nothing.
+3. **Direct light.** A cell brighter than 1.5× the median is directly lit. Its excess light is shared
+   between the shining sources by `brightness × area / distance²`. Light that no shining source explains
+   gets no rays.
+4. **Rays.** Lit cells form one ray when they share a direction from a lamp (6° bins), or when they cross a
+   window in the same 12 cm cell with the same direction. Only the first surface along a ray is lit; the
+   rest lies in its shadow.
+5. **Beams.** Every slice of a ray carries the same energy, spread over a disc as wide as the bundle of light
+   paths it stands for.
+   - From a lamp, a ray starts as a point and widens towards the patch it lights. Its density falls as
+     `1/r²`, so it dissolves.
+   - Sunlight through a window is parallel and stays a shaft.
+   - Rays are drawn at 0.3 of their bundle's width so the direction stays readable.
+6. **Ambient light.** A uniform density through the room, proportional to the median surface brightness
+   and coloured by the median temperature.
+7. **Quanta.** One quantum is the whole day's light energy divided by the splat budget (60 000).
+   - A cell expecting `n = energy / quantum` splats splits into eight children when `n > 1`. Otherwise it
+     emits one splat with probability `n`, at the energy centroid of the cell.
+   - There is at most one splat per 4 cm cell. The densest light becomes a regular lattice and dim light a
+     sparse one.
+   - Each splat sits where its light passed, so rays become dotted lines.
+
+### Time
+
+Moments are layered by time of day, so moments from different days fill one day. The timeline has two
+modes:
+
+- **Accumulate**: light builds up as the day goes on.
+- **Moment**: only the scans nearest to the current time are visible.
+
+▶ plays the day.
+
+| Setting | Default | What it does |
+|---|---|---|
+| Room brightness | 45% | camera brightness while the light is shown |
+| Splat size | 6 mm | Gaussian σ of every splat |
+| Splat opacity | 0.14 | peak opacity of every splat |
+| Light exposure | 1.0 | tonemap `1 − exp(−exposure · light)` |
+| Hide light behind objects | on | occlusion by LiDAR depth |
+| Splats for the whole room | 60k | splat budget; sets the size of one quantum |
+| Direct light threshold | ×1.5 median | when a surface counts as directly lit |
+| Source threshold | ×4 median | when a window or lamp counts as shining |
+| Rays | 1.0 | energy of direct light |
+| Ambient light | 0.3 | energy of ambient light |
+| Angle between rays | 6° | angular spacing of rays |
+| Ray width | 0.3 | ray width relative to its bundle |
+| Ray spacing in windows | 12 cm | spacing of the cells where rays cross a window |
+| Colour range | ±90 mired | temperature span of the palette |
+
+## Rendering
+
+- **Camera feed.** YCbCr → RGB conversion happens in a Metal shader. The feed is dimmed while the light is
+  shown, so the light reads better.
+- **Identical splats.** Every splat is the same camera-facing quad with one Gaussian profile. Splats are
+  accumulated additively into a half-resolution float target. Splats closer than 0.3 m are hidden and fade
+  in up to 0.7 m.
+- **Occlusion.** Each splat's distance is compared with the LiDAR depth at its point on screen, so light
+  behind real objects disappears.
+- **Composite.** The light is tonemapped as `1 − exp(−k · light)` and screen-blended over the camera:
+  `result = light + camera · (1 − light)`.
+- **Scan preview.** During a scan, the cells covered so far appear as dots coloured by the light that falls
+  on them.
+- **Finding the room again.** ARKit's own relocalisation matches visual features, which change with the
+  light, and light is what this app records. So a reopened room is found from LiDAR geometry alone.
+  - While you look around, the walls and furniture you see are matched against the earlier scans. Both AR
+    sessions are gravity aligned, so only a turn about the vertical and a shift are unknown.
+  - A coarse search votes over every 3° of turn, comparing 20 cm height layers on a 10 cm grid. The best
+    candidates are then refined point-to-point and point-to-plane, ignoring the 30% worst matches.
+  - A pose is accepted when most of what you see lands on the old surfaces, no line of sight passes through
+    them, no clearly different pose comes close, and two attempts in a row agree.
+  - A perfectly symmetric empty room cannot be told apart from its turned copy, so the app keeps waiting
+    instead of guessing.
+  - Manual alignment by two marked points (a window's corners or two lamps) remains as a fallback.
+
+## Project structure
+
+In the code the project still uses its working title, Lumen.
 
 ```
-xcodegen generate
-open Lumen.xcodeproj
-```
-
-1. Set your Team under target **Lumen** → Signing & Capabilities. Put it in `DEVELOPMENT_TEAM` in
-   `project.yml` so it survives regeneration.
-2. If the bundle identifier is taken, change `PRODUCT_BUNDLE_IDENTIFIER` in `project.yml`.
-3. The Run scheme builds Release on purpose: building the light field is much slower without optimisation.
-
-## Using the app
-
-- **Mark**
-  - Lamp: tap its shade or bulb.
-  - Window: tap one corner, then the opposite one. Drag any corner to adjust it; it moves within the
-    window's plane.
-  - Sources that are not shining in the latest moment turn grey.
-- **Scan (big button):** sweep over the whole room, including walls, floor, ceiling and corners, then tap
-  again to stop.
-  - Scanned surfaces appear as dots coloured by the light that falls on them.
-  - Elapsed time and scanned area are shown above the button.
-- **Timeline:** *Accumulate* builds the light up over the day; *Moment* shows the nearest scan. ▶ plays
-  the day.
-- **Hide interface** (crossed-out eye, top right): only the camera and the light remain. The faint eye in
-  the bottom-right corner brings the interface back.
-- **Room menu** (room name, top left): new room, delete all moments, reset the whole room, switch rooms.
-- **Settings:**
-  - Look: room brightness, splat size and opacity, exposure, LiDAR occlusion, markers.
-  - Light law: splat budget, thresholds, ray angle, width and spacing, ambient light, colour range.
-- **Relocalisation:** when a room is reopened, Lumen relocalises with its saved ARKit world map. If that
-  fails, tap **Align** and re-mark the corners of the first window, or the first two lamps.
-
-Data lives in Files → On My iPhone → Lumen → Rooms (the app's working name):
-- `room.json` holds the sources, moments and law.
-- `captures/*.bin` holds the surface cells.
-- `world.armap` holds the ARKit map.
-
-## Honest limitations
-
-- The camera sees light reflected by surfaces, not the light itself. A red wall under white light reads as
-  warm light.
-- Clipped highlights only give a lower bound for brightness.
-- The direction of direct light comes from the marked sources. Light from an unmarked source gets no rays.
-
-## Structure
-
-```
-LumenCore/              platform-independent core (Swift Package, with tests)
+LumenCore/              light law as a Swift package, platform-independent, with unit tests
   Colorimetry.swift     YCbCr → RGB → linear, colour temperature, palette
   LightSource.swift     windows and lamps, window geometry
-  Capture.swift         surface cells, accumulator (clipping-aware)
-  LightField.swift      the law: source gating, bundled rays, ambient light, quantum sampling,
+  Capture.swift         surface cells, clipping-aware accumulation
+  LightField.swift      source gating, rays and beams, ambient light, quantum sampling,
                         timeline, alignment
+  RoomRegistration.swift  finding a room again from LiDAR geometry
 App/
-  Capture/              camera settings, scan processing, source brightness probes
-  Controller/           AR session, modes, scanning, reset, rebuilding the light
+  Capture/              camera settings, scan processing, source brightness probes, geometry probe
+  Controller/           AR session, marking, scanning, rebuilding the light
   Rendering/            Metal: camera, splats, composite, markers, scan preview
-  Storage/              rooms, moments, ARKit world map
-  UI/                   SwiftUI interface
-prototype/              Python prototype of the law (synthetic room, renders for comparison)
+  Storage/              rooms and moments
+  UI/                   SwiftUI screen and settings
+prototype/              Python model of the law on a synthetic room
 ```
+
+## Running
+
+1. Install [XcodeGen](https://github.com/yonaskolb/XcodeGen), run `xcodegen generate` and open
+   `Lumen.xcodeproj`. The deployment target is iOS 18.
+2. Choose your team under Signing & Capabilities.
+3. Run on an iPhone or iPad with LiDAR. The scheme builds Release, because building the light field is slow
+   without optimisation.
+
+**In the app:**
+
+- **Mark**: tap a lamp, or two opposite corners of a window. Sources that aren't shining in the latest
+  moment turn grey.
+- The big button starts and stops a scan.
+- **Accumulate** / **Moment** and ▶ on the timeline.
+- The eye button hides every control for a clean screen recording. A tap anywhere brings them back.
+- The room name opens the room menu: new room, delete moments, reset, switch rooms.
+
+## Limitations
+
+- The camera measures light reflected by surfaces, not the light itself. A red wall under white light reads
+  as warm light.
+- Clipped highlights, such as a bulb or a sun patch, only give a lower bound.
+- The direction of direct light comes from the marked sources. Light from an unmarked source gets no rays.
+- Rays model where the light travels; they are not a simulation of scattering in air. The figure shows what
+  the measured surfaces imply.
+- LiDAR reaches about 5 m. Everything depends on ARKit tracking: in poor light the scan can drift.
+- Finding a room needs some structure: you have to look around at least 150°, and an empty, perfectly
+  symmetric room cannot be found automatically.
+
+## Credits
+
+Design and engineering by Dima Nesterov.

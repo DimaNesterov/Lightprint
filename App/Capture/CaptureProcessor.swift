@@ -242,3 +242,101 @@ final class CaptureProcessor {
         if f.exposureFromExif { exifFrames += 1 }
     }
 }
+
+/// Surface points seen while finding a room (geometry only, any light), on a 5 cm grid, with the camera
+/// position each point was seen from (for the line-of-sight check of the registration).
+final class GeometryProbe {
+    private let queue = DispatchQueue(label: "lumen.probe", qos: .userInitiated)
+    private var cells: [Int64: (sum: Vec3, eye: Vec3, n: Float)] = [:]
+    private let lock = NSLock()
+    private var pending = 0
+    private var count = 0
+    private let cell: Float = 0.05
+
+    /// Whether another frame can be queued now (it holds an ARKit depth buffer until processed).
+    var canAccept: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pending < 1
+    }
+
+    /// Number of 5 cm cells seen so far.
+    var cellCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return count
+    }
+
+    func add(_ frame: ARFrame) {
+        guard let depth = frame.sceneDepth?.depthMap else { return }
+        let confidence = frame.sceneDepth?.confidenceMap
+        let geometry = CameraGeometry(camera: frame.camera)
+        let t = frame.camera.transform.columns.3
+        let eye = Vec3(t.x, t.y, t.z)
+        let imageSize = frame.camera.imageResolution
+        lock.lock(); pending += 1; lock.unlock()
+        queue.async {
+            self.process(depth: depth, confidence: confidence, geometry: geometry, imageSize: imageSize, eye: eye)
+            self.lock.lock(); self.pending -= 1; self.count = self.cells.count; self.lock.unlock()
+        }
+    }
+
+    /// Points and camera positions seen so far, delivered on the main queue.
+    func snapshot(completion: @escaping @MainActor (_ points: [Vec3], _ eyes: [Vec3]) -> Void) {
+        queue.async {
+            var points: [Vec3] = [], eyes: [Vec3] = []
+            points.reserveCapacity(self.cells.count)
+            eyes.reserveCapacity(self.cells.count)
+            for c in self.cells.values {
+                points.append(c.sum / c.n)
+                eyes.append(c.eye / c.n)
+            }
+            DispatchQueue.main.async { MainActor.assumeIsolated { completion(points, eyes) } }
+        }
+    }
+
+    private static func key(_ i: Int, _ j: Int, _ k: Int) -> Int64 {
+        let o = 1 << 20
+        return (Int64(i + o) << 42) | (Int64(j + o) << 21) | Int64(k + o)
+    }
+
+    private func process(depth: CVPixelBuffer, confidence: CVPixelBuffer?, geometry: CameraGeometry,
+                         imageSize: CGSize, eye: Vec3) {
+        CVPixelBufferLockBaseAddress(depth, .readOnly)
+        if let confidence { CVPixelBufferLockBaseAddress(confidence, .readOnly) }
+        defer {
+            CVPixelBufferUnlockBaseAddress(depth, .readOnly)
+            if let confidence { CVPixelBufferUnlockBaseAddress(confidence, .readOnly) }
+        }
+        guard let dBase = CVPixelBufferGetBaseAddress(depth) else { return }
+        let dW = CVPixelBufferGetWidth(depth), dH = CVPixelBufferGetHeight(depth)
+        let dStride = CVPixelBufferGetBytesPerRow(depth)
+        var confBase: UnsafeMutableRawPointer?
+        var confStride = 0
+        if let c = confidence, CVPixelBufferGetWidth(c) == dW, CVPixelBufferGetHeight(c) == dH {
+            confBase = CVPixelBufferGetBaseAddress(c)
+            confStride = CVPixelBufferGetBytesPerRow(c)
+        }
+        let sx = Float(imageSize.width) / Float(dW), sy = Float(imageSize.height) / Float(dH)
+        let stride = 4                                          // 64 × 48 points per frame
+        var y = 0
+        while y < dH {
+            let dRow = dBase.advanced(by: y * dStride).assumingMemoryBound(to: Float32.self)
+            let cRow = confBase?.advanced(by: y * confStride).assumingMemoryBound(to: UInt8.self)
+            var x = 0
+            while x < dW {
+                defer { x += stride }
+                if let cRow, cRow[x] < 2 { continue }
+                let d = dRow[x]
+                guard d.isFinite, d > 0.3, d < 5 else { continue }
+                let p = geometry.unproject(pixel: SIMD2<Float>((Float(x) + 0.5) * sx, (Float(y) + 0.5) * sy), depth: d)
+                let key = Self.key(Int((p.x / cell).rounded(.down)), Int((p.y / cell).rounded(.down)),
+                                   Int((p.z / cell).rounded(.down)))
+                var c = cells[key] ?? (.zero, .zero, 0)
+                c.sum += p
+                c.eye += eye
+                c.n += 1
+                cells[key] = c
+            }
+            y += stride
+        }
+    }
+}

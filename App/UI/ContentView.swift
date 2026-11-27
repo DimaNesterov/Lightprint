@@ -12,9 +12,19 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
             if controller.lidarAvailable {
-                if controller.interfaceHidden {
-                    ShowInterfaceButton(controller: controller)
-                } else {
+                switch controller.interface {
+                case .hidden:
+                    // A tap anywhere brings the interface back.
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.25)) { controller.interface = .visible }
+                        }
+                case .playOnly:
+                    PlayOnlyLayer(controller: controller)
+                        .transition(.opacity)
+                case .visible:
                     VStack(spacing: 12) {
                         TopBar(controller: controller, showSettings: $showSettings)
                         Spacer()
@@ -44,31 +54,37 @@ struct ContentView: View {
     }
 }
 
-/// The only control left when the interface is hidden: a faint button in the corner that brings it back.
-private struct ShowInterfaceButton: View {
+/// First step of hiding the interface: only the button that draws the light in. Tapping it hides that too and
+/// starts the animation; tapping anywhere else just hides everything.
+private struct PlayOnlyLayer: View {
     @ObservedObject var controller: LumenController
 
     var body: some View {
-        VStack {
-            Spacer()
-            HStack {
+        ZStack {
+            Color.clear
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.25)) { controller.interface = .hidden }
+                }
+            VStack {
                 Spacer()
                 Button {
-                    withAnimation(.easeInOut(duration: 0.25)) { controller.interfaceHidden = false }
+                    withAnimation(.easeInOut(duration: 0.25)) { controller.playRevealHidden() }
                 } label: {
-                    Image(systemName: "eye")
-                        .font(.system(size: 15, weight: .semibold))
-                        .frame(width: 40, height: 40)
-                        .background(.ultraThinMaterial, in: Circle())
+                    VStack(spacing: 6) {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .frame(width: 64, height: 64)
+                            .background(.ultraThinMaterial, in: Circle())
+                        Text("Draw the light")
+                            .font(.caption)
+                    }
                 }
                 .buttonStyle(.plain)
-                .opacity(0.35)
-                .accessibilityLabel("Show interface")
+                .padding(.bottom, 24)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.bottom, 10)
-        .transition(.opacity)
     }
 }
 
@@ -86,7 +102,7 @@ private struct TopBar: View {
                 if controller.mode == .main {
                     if !controller.isCapturing && !controller.isSaving {
                         RoundIcon(system: "eye.slash") {
-                            withAnimation(.easeInOut(duration: 0.25)) { controller.interfaceHidden = true }
+                            withAnimation(.easeInOut(duration: 0.25)) { controller.interface = .playOnly }
                         }
                     }
                     if !controller.manifest.captures.isEmpty {
@@ -180,7 +196,7 @@ private struct RoomMenu: View {
                             titleVisibility: .visible) {
             Button("Reset", role: .destructive) { controller.resetRoom() }
         } message: {
-            Text("Moments, windows, lamps and the room map will be deleted.")
+            Text("Moments, windows and lamps will be deleted.")
         }
     }
 }

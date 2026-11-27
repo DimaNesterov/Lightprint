@@ -17,6 +17,30 @@ struct RenderSettings: Codable, Equatable {
     var occlusion: Bool = true
     /// Show marked windows and lamps while viewing the light.
     var showMarkers: Bool = false
+    /// Draw the light in when it appears: rays grow out of their sources, then ambient light fades in.
+    var animateReveal: Bool = true
+    /// Splats near a moving phone move slightly aside and drift back when it stops.
+    var pushParticles: Bool = true
+
+    init() {}
+
+    // Tolerant decoding: settings saved by an older version keep their values, new ones take defaults.
+    private enum CodingKeys: String, CodingKey {
+        case cameraDim, sigma, opacity, exposure, occlusion, showMarkers, animateReveal, pushParticles
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = RenderSettings()
+        cameraDim = try c.decodeIfPresent(Float.self, forKey: .cameraDim) ?? d.cameraDim
+        sigma = try c.decodeIfPresent(Float.self, forKey: .sigma) ?? d.sigma
+        opacity = try c.decodeIfPresent(Float.self, forKey: .opacity) ?? d.opacity
+        exposure = try c.decodeIfPresent(Float.self, forKey: .exposure) ?? d.exposure
+        occlusion = try c.decodeIfPresent(Bool.self, forKey: .occlusion) ?? d.occlusion
+        showMarkers = try c.decodeIfPresent(Bool.self, forKey: .showMarkers) ?? d.showMarkers
+        animateReveal = try c.decodeIfPresent(Bool.self, forKey: .animateReveal) ?? d.animateReveal
+        pushParticles = try c.decodeIfPresent(Bool.self, forKey: .pushParticles) ?? d.pushParticles
+    }
 }
 
 /// One marker point (UI only).
@@ -56,6 +80,11 @@ private struct SplatUniforms {
     var nearEnd: Float
     var occlusion: Float
     var layerCount: UInt32
+    var cameraPush: SIMD4<Float>    // camera position, w = push strength 0…1 (how fast the phone moves)
+    var revealTime: Float           // seconds since the light started to be drawn in; huge = fully drawn
+    var revealSpeed: Float          // metres per second of the drawing front along the rays
+    var pushRadius: Float           // metres around the phone
+    var pushAmount: Float           // largest displacement, metres
 }
 
 private struct CompositeUniforms {
@@ -96,6 +125,17 @@ final class LightRenderer: NSObject, MTKViewDelegate {
     private var layerWeights: [Float] = [0]
     private var markerBuffer: MTLBuffer?
     private var markerCount = 0
+
+    // Drawing the light in
+    private var revealStart: CFTimeInterval?
+    static let revealSpeed: Float = 1.2          // m/s along the rays
+    static let revealDuration: CFTimeInterval = 9
+
+    // Particles moving aside around the phone
+    private var lastCameraPosition: SIMD3<Float>?
+    private var lastFrameTime: CFTimeInterval = 0
+    private var smoothedSpeed: Float = 0
+    private var pushStrength: Float = 0
     private var scanBuffer: MTLBuffer?
     private var scanCount = 0
 
@@ -177,10 +217,16 @@ final class LightRenderer: NSObject, MTKViewDelegate {
         }
         let gpu = splats.map {
             GPUSplat(positionLayer: SIMD4<Float>($0.position.x, $0.position.y, $0.position.z, Float($0.layer)),
-                     color: SIMD4<Float>($0.color.x, $0.color.y, $0.color.z, 1))
+                     color: SIMD4<Float>($0.color.x, $0.color.y, $0.color.z, $0.reveal))
         }
         splatBuffer = gpu.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
         splatCount = splatBuffer == nil ? 0 : gpu.count
+    }
+
+    /// Starts drawing the light in from its sources (if the setting is on, or when asked for explicitly).
+    /// With a delay the light disappears at once and starts growing only after `delay` seconds.
+    func startReveal(force: Bool = false, delay: CFTimeInterval = 0) {
+        revealStart = (settings.animateReveal || force) ? CACurrentMediaTime() + delay : nil
     }
 
     func setLayerWeights(_ weights: [Float]) {
@@ -254,6 +300,26 @@ final class LightRenderer: NSObject, MTKViewDelegate {
             if let enc = commandBuffer.makeRenderCommandEncoder(descriptor: pass) {
                 let viewport = SIMD2<Float>(Float(light.width), Float(light.height))
                 let k = camera.intrinsics
+                // Drawing-in clock.
+                let now = CACurrentMediaTime()
+                var revealTime: Float = 1e6
+                if let start = revealStart {
+                    if now - start < Self.revealDuration { revealTime = Float(now - start) } else { revealStart = nil }
+                }
+                // How fast the phone moves: splats near it move aside, then drift back when it stops.
+                let camPos = SIMD3<Float>(camera.transform.columns.3.x, camera.transform.columns.3.y,
+                                          camera.transform.columns.3.z)
+                if now - lastFrameTime > 0.25 { lastCameraPosition = nil }     // light was hidden: no jump
+                let dt = Float(min(max(now - lastFrameTime, 1.0 / 120), 0.1))
+                var speed: Float = 0
+                if let last = lastCameraPosition { speed = simd_length(camPos - last) / dt }
+                lastCameraPosition = camPos
+                lastFrameTime = now
+                smoothedSpeed += (speed - smoothedSpeed) * (1 - exp(-dt / 0.12))   // tracking jitter averages out
+                let target: Float = settings.pushParticles ? min(max((smoothedSpeed - 0.05) / 0.3, 0), 1) : 0
+                let tau: Float = target > pushStrength ? 0.2 : 1.0      // quick to push, slow to settle back
+                pushStrength += (target - pushStrength) * (1 - exp(-dt / tau))
+
                 var u = SplatUniforms(
                     viewProjection: viewProjection,
                     view: viewMatrix,
@@ -268,7 +334,12 @@ final class LightRenderer: NSObject, MTKViewDelegate {
                     nearStart: 0.3,
                     nearEnd: 0.7,
                     occlusion: settings.occlusion ? 1 : 0,
-                    layerCount: UInt32(layerWeights.count))
+                    layerCount: UInt32(layerWeights.count),
+                    cameraPush: SIMD4<Float>(camPos.x, camPos.y, camPos.z, pushStrength),
+                    revealTime: revealTime,
+                    revealSpeed: Self.revealSpeed,
+                    pushRadius: 1.0,
+                    pushAmount: 0.06)
                 var weights = layerWeights
                 enc.setRenderPipelineState(splatPipeline)
                 enc.setVertexBuffer(splats, offset: 0, index: 0)

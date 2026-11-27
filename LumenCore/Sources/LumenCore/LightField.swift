@@ -72,6 +72,9 @@ public struct Splat: Equatable, Sendable {
     public var position: Vec3
     public var color: Vec3
     public var layer: Int
+    /// When the splat appears while the light is drawn in. ≥ 0: a ray splat, distance in metres from its source
+    /// along the ray. < 0: an ambient splat, −reveal ∈ (0, 1] is its delay within the ambient fade-in.
+    public var reveal: Float = 0
 }
 
 /// One ray of direct light: from a source to the surface it lights. Every slice of the ray carries the same
@@ -93,6 +96,8 @@ public struct LightVolume: Sendable {
     public var energy: [Float]
     public var colorEnergy: [Vec3]      // energy-weighted display colour
     public var positionEnergy: [Vec3]   // energy-weighted position: splats sit where the light passed
+    public var beamEnergy: [Float]      // the part of `energy` carried by rays
+    public var revealEnergy: [Float]    // ray energy × distance from its source along the ray
 
     public init(origin: Vec3, cell: Float, nx: Int, ny: Int, nz: Int) {
         self.origin = origin
@@ -103,6 +108,8 @@ public struct LightVolume: Sendable {
         energy = [Float](repeating: 0, count: nx * ny * nz)
         colorEnergy = [Vec3](repeating: .zero, count: nx * ny * nz)
         positionEnergy = [Vec3](repeating: .zero, count: nx * ny * nz)
+        beamEnergy = [Float](repeating: 0, count: nx * ny * nz)
+        revealEnergy = [Float](repeating: 0, count: nx * ny * nz)
     }
 
     @inlinable public func index(_ i: Int, _ j: Int, _ k: Int) -> Int { (k * ny + j) * nx + i }
@@ -158,12 +165,13 @@ public struct LightVolume: Sendable {
             for k in 0..<n {
                 let rr = radius * ((Float(k) + 0.5) / Float(n)).squareRoot()
                 let phi = Float(k) * golden + Float(s) * 0.7
-                depositPoint(centre + (u * cos(phi) + w * sin(phi)) * rr, energy: e, color: color)
+                depositPoint(centre + (u * cos(phi) + w * sin(phi)) * rr, energy: e, color: color,
+                             distance: t * length)
             }
         }
     }
 
-    private mutating func depositPoint(_ p: Vec3, energy e: Float, color: Vec3) {
+    private mutating func depositPoint(_ p: Vec3, energy e: Float, color: Vec3, distance: Float) {
         let q = (p - origin) / cell
         let i = Int(q.x.rounded(.down)), j = Int(q.y.rounded(.down)), k = Int(q.z.rounded(.down))
         guard i >= 0, j >= 0, k >= 0, i < nx, j < ny, k < nz else { return }
@@ -171,6 +179,8 @@ public struct LightVolume: Sendable {
         energy[idx] += e
         colorEnergy[idx] += color * e
         positionEnergy[idx] += p * e
+        beamEnergy[idx] += e
+        revealEnergy[idx] += e * distance
     }
 
     /// Deposits `energyPerMetre × length` along segment a→b (3D DDA, Amanatides–Woo):
@@ -204,6 +214,8 @@ public struct LightVolume: Sendable {
                 energy[idx] += e
                 colorEnergy[idx] += color * e
                 positionEnergy[idx] += mid * e
+                beamEnergy[idx] += e
+                revealEnergy[idx] += e * 0.5 * (t + tNext) * lengthMetres
             }
             if tNext >= 1 { break }
             if tmx <= tmy && tmx <= tmz {
@@ -450,14 +462,19 @@ public enum LightFieldBuilder {
             var e: [Float]
             var c: [Vec3]
             var p: [Vec3]
+            var b: [Float]
+            var r: [Float]
         }
         var levels = [Level(nx: volume.nx, ny: volume.ny, nz: volume.nz,
-                            e: volume.energy, c: volume.colorEnergy, p: volume.positionEnergy)]
+                            e: volume.energy, c: volume.colorEnergy, p: volume.positionEnergy,
+                            b: volume.beamEnergy, r: volume.revealEnergy)]
         while let last = levels.last, last.nx > 1 || last.ny > 1 || last.nz > 1 {
             let nx = (last.nx + 1) / 2, ny = (last.ny + 1) / 2, nz = (last.nz + 1) / 2
             var e = [Float](repeating: 0, count: nx * ny * nz)
             var c = [Vec3](repeating: .zero, count: nx * ny * nz)
             var p = [Vec3](repeating: .zero, count: nx * ny * nz)
+            var b = [Float](repeating: 0, count: nx * ny * nz)
+            var r = [Float](repeating: 0, count: nx * ny * nz)
             for k in 0..<last.nz {
                 for j in 0..<last.ny {
                     for i in 0..<last.nx {
@@ -466,10 +483,12 @@ public enum LightFieldBuilder {
                         e[dst] += last.e[src]
                         c[dst] += last.c[src]
                         p[dst] += last.p[src]
+                        b[dst] += last.b[src]
+                        r[dst] += last.r[src]
                     }
                 }
             }
-            levels.append(Level(nx: nx, ny: ny, nz: nz, e: e, c: c, p: p))
+            levels.append(Level(nx: nx, ny: ny, nz: nz, e: e, c: c, p: p, b: b, r: r))
         }
 
         var out: [Splat] = []
@@ -489,7 +508,11 @@ public enum LightFieldBuilder {
                 continue
             }
             if hash01(i, j, k, layer &* 31 &+ level) < min(n, 1) {
-                out.append(Splat(position: L.p[idx] / e, color: L.c[idx] / e, layer: layer))
+                // Mostly ray light: appears when the drawing front reaches it. Mostly ambient: fades in later.
+                let beam = L.b[idx]
+                let reveal = beam >= 0.5 * e ? L.r[idx] / beam
+                                              : -(0.05 + 0.95 * hash01(i, j, k, layer &* 31 &+ level &+ 7919))
+                out.append(Splat(position: L.p[idx] / e, color: L.c[idx] / e, layer: layer, reveal: reveal))
             }
         }
         return out
